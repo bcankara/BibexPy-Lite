@@ -1,6 +1,15 @@
 # BibexPy-Lite
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/bcankara/BibexPy-Lite/blob/main/BibexPy_Lite.ipynb)
+<p align="center">
+  <a href="https://colab.research.google.com/github/bcankara/BibexPy-Lite/blob/main/BibexPy_Lite.ipynb">
+    <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab" height="36">
+  </a>
+</p>
+
+<p align="center">
+  <strong>▶ Merge Web of Science + Scopus in Google Colab — nothing to install.</strong><br>
+  <a href="https://colab.research.google.com/github/bcankara/BibexPy-Lite/blob/main/BibexPy_Lite.ipynb"><b>Open the notebook</b></a> → run cell 1 → run cell 2 → pick your project.
+</p>
 
 A **lightweight, terminal / Colab** tool that merges **Web of Science + Scopus**
 exports into a single deduplicated dataset using BibexPy's **Smart Merge**
@@ -31,10 +40,16 @@ to `Borderline_Uncertain.xlsx` for you to review manually.
 
 ---
 
-## Use in Google Colab (recommended)
+## ▶ Run in Google Colab (recommended — no install)
 
-Click the **Open in Colab** badge above, then run the cells. You can try the
-bundled *Sample Project* or upload your own WoS/Scopus exports.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/bcankara/BibexPy-Lite/blob/main/BibexPy_Lite.ipynb)
+
+1. Click the badge → the notebook opens in Colab.
+2. Run **cell 1** (setup) and **cell 2** (merge) — pick your project from the menu.
+3. Try the bundled **Sample Project**, or upload your own WoS `.txt` + Scopus `.csv`
+   with the optional cell, then run cell 2.
+
+Results are saved under `Workspace/<project>/Analysis_<timestamp>/`.
 
 ## Use in a terminal
 
