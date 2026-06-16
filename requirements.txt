@@ -1,0 +1,5 @@
+# BibexPy-Lite — minimal dependencies (merge only, no API/ML enrichment).
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.2
+colorama>=0.4.6
