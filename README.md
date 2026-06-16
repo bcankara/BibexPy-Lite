@@ -1,4 +1,8 @@
-# BibexPy-Lite
+<p align="center">
+  <a href="https://colab.research.google.com/github/bcankara/BibexPy-Lite/blob/main/BibexPy_Lite.ipynb">
+    <img src=".github/assets/bibexpy-lite-header.png" alt="BibexPy-Lite — Smart Merge for Web of Science + Scopus" width="760">
+  </a>
+</p>
 
 <p align="center">
   <a href="https://colab.research.google.com/github/bcankara/BibexPy-Lite/blob/main/BibexPy_Lite.ipynb">
