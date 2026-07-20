@@ -150,12 +150,28 @@ def _to_str(v: Any) -> str:
     return str(v).strip()
 
 
+def _clean_num(v: Any) -> str:
+    """Comparison form for numeric fields (VL/BP/PG): '100.0' -> '100'."""
+    s = _to_str(v)
+    if re.fullmatch(r"\d+\.0+", s):
+        return s.split(".", 1)[0]
+    return s
+
+
 def normalize_doi(raw: Any) -> Optional[str]:
     s = _to_str(raw)
     if not s:
         return None
     s = s.lower()
-    s = _DOI_PREFIX_RE.sub("", s)
+    # Dirty data can stack prefixes ('doi:', double 'https://doi.org/'); strip
+    # until stable.
+    for _ in range(4):
+        prev = s
+        s = _DOI_PREFIX_RE.sub("", s)
+        s = re.sub(r"^doi\s*:\s*", "", s)
+        s = re.sub(r"^doi\.org/", "", s)
+        if s == prev:
+            break
     s = s.rstrip("/. \t")
     if not s.startswith("10."):
         return None
@@ -235,22 +251,6 @@ def build_blocks(df: pd.DataFrame) -> dict[tuple[Optional[int], str], list[int]]
 #  Multi-stage matching
 # ════════════════════════════════════════════════════════════════════════
 
-def negative_rule_check(w: dict, s: dict) -> Optional[str]:
-    """Conflicting identifiers -> reject (never the same publication).
-
-    DOI is determinative: if both records have a normalized DOI and they differ,
-    they are different publications regardless of title/journal similarity (no
-    auto-merge, never enters the borderline queue). The same conflict logic
-    applies to PMID and ISSN.
-    """
-    for key in ("_norm_doi", "_norm_pmid", "_norm_issn"):
-        wv = w.get(key)
-        sv = s.get(key)
-        if wv and sv and wv != sv:
-            return f"{key.replace('_norm_', '').upper()} mismatch ({wv} != {sv})"
-    return None
-
-
 def doi_conflict(raw_a: Any, raw_b: Any) -> bool:
     """True if both raw DOIs normalize to present-but-different values."""
     a = normalize_doi(raw_a)
@@ -259,13 +259,14 @@ def doi_conflict(raw_a: Any, raw_b: Any) -> bool:
 
 
 def compute_match(w: dict, s: dict) -> Optional[dict]:
-    # Stage 0 — Negative rules (reject)
-    if negative_rule_check(w, s):
-        return None
-
-    # Stage 1 — DOI exact
+    # Identifier HIERARCHY: DOI > PMID > ISSN. An exact match at a higher
+    # level overrides conflicts below it (WoS ships the print ISSN, Scopus the
+    # e-ISSN — an ISSN difference must not veto a same-DOI pair). Lower-level
+    # conflicts only reject when no higher identifier can be compared.
     w_doi = w.get("_norm_doi")
     s_doi = s.get("_norm_doi")
+    if w_doi and s_doi and w_doi != s_doi:
+        return None
     if w_doi and s_doi and w_doi == s_doi:
         return {
             "stage": "1_doi_exact", "stage_label": "DOI exact", "confidence": 1.00,
@@ -273,15 +274,23 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
             "jw_title": None, "year_diff": None, "surname_match": None,
         }
 
-    # Stage 2 — PMID exact
+    # PMID (when DOIs could not be compared): conflict -> reject; equal -> merge
     w_pmid = w.get("_norm_pmid")
     s_pmid = s.get("_norm_pmid")
+    if w_pmid and s_pmid and w_pmid != s_pmid:
+        return None
     if w_pmid and s_pmid and w_pmid == s_pmid:
         return {
             "stage": "2_pmid_exact", "stage_label": "PMID exact", "confidence": 0.99,
             "reason": f"PMID exact: {w_pmid}",
             "jw_title": None, "year_diff": None, "surname_match": None,
         }
+
+    # ISSN (journal-level guard): only vetoes the title-based stages
+    w_issn = w.get("_norm_issn")
+    s_issn = s.get("_norm_issn")
+    if w_issn and s_issn and w_issn != s_issn:
+        return None
 
     # Stage 3 — Title JW + Year +-1 + Surname
     w_title = w.get("_norm_title", "")
@@ -295,8 +304,14 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
         s_surname = s.get("_norm_surname", "")
         surname_match = bool(w_surname and s_surname and w_surname == s_surname)
 
+        # Generic/short titles ("Editorial", "Erratum") can belong to several
+        # distinct papers by the same author in the same year; they may only
+        # merge via identifiers or Journal+Volume+Pages.
+        informative_title = len(w_title.split()) >= 3 or len(w_title) >= 15
+
         if (
-            jw_title >= TITLE_EXACT_THRESHOLD
+            informative_title
+            and jw_title >= TITLE_EXACT_THRESHOLD
             and year_diff is not None
             and year_diff <= YEAR_TOLERANCE
             and surname_match
@@ -313,12 +328,12 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
         s_journal = s.get("_norm_journal", "")
         if w_journal and s_journal:
             jw_journal = jaro_winkler(w_journal, s_journal)
-            w_vol = _to_str(w.get("VL", ""))
-            s_vol = _to_str(s.get("VL", ""))
-            w_bp = _to_str(w.get("BP", ""))
-            s_bp = _to_str(s.get("BP", ""))
-            w_pg = _to_str(w.get("PG", ""))
-            s_pg = _to_str(s.get("PG", ""))
+            w_vol = _clean_num(w.get("VL", ""))
+            s_vol = _clean_num(s.get("VL", ""))
+            w_bp = _clean_num(w.get("BP", ""))
+            s_bp = _clean_num(s.get("BP", ""))
+            w_pg = _clean_num(w.get("PG", ""))
+            s_pg = _clean_num(s.get("PG", ""))
             page_match = (w_bp and s_bp and w_bp == s_bp) or (w_pg and s_pg and w_pg == s_pg)
             if (
                 jw_journal >= JOURNAL_SIMILARITY
