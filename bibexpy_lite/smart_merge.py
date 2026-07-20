@@ -454,6 +454,91 @@ def _add_norm_columns(df: pd.DataFrame) -> None:
     df["_norm_journal"] = df.get("SO", pd.Series([""] * n, index=df.index)).apply(normalize_title)
 
 
+def dedup_within_source(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Drop identifier-duplicates WITHIN one source (same UT/EID or same DOI).
+
+    Overlapping export files can bring the same record twice; cross-source
+    matching only compares WoS vs Scopus, so these survived (and a leftover
+    same-DOI copy also defeats greedy one-to-one assignment). The richest row
+    (most non-empty cells) per identifier group is kept.
+    """
+    if df.empty:
+        return df, 0
+    richness = df.notna().sum(axis=1) + (df.astype(str) != "").sum(axis=1)
+    drop: set = set()
+    for key_col in ("_norm_ut", "_norm_doi"):
+        if key_col not in df.columns:
+            continue
+        best_for: dict = {}
+        for idx in df.index:
+            if idx in drop:
+                continue
+            v = df.at[idx, key_col]
+            if not v:
+                continue
+            prev = best_for.get(v)
+            if prev is None:
+                best_for[v] = idx
+            elif richness[idx] > richness[prev]:
+                drop.add(prev)
+                best_for[v] = idx
+            else:
+                drop.add(idx)
+    if not drop:
+        return df, 0
+    return df.loc[~df.index.isin(drop)], len(drop)
+
+
+def generate_candidates(
+    wos_df: pd.DataFrame, scp_df: pd.DataFrame,
+) -> list[tuple[float, int, int, dict]]:
+    """Candidate (WoS, Scopus) pairs — IDENTIFIER-FIRST, then blocking.
+
+    Any pair sharing a normalized DOI (or PMID) is evaluated REGARDLESS of
+    blocks. Blocking-only candidate generation silently skipped same-DOI pairs
+    whose surname parsed differently across sources ("RAHIM ZA" vs
+    "ABDUL RAHIM NR") or whose years differed (early access vs print), so
+    DOI-exact never got a chance and duplicates survived. Blocking now only
+    scopes the title-similarity stages.
+    """
+    candidates: list[tuple[float, int, int, dict]] = []
+    seen_pairs: set[tuple[int, int]] = set()
+
+    def consider(w_idx: int, s_idx: int) -> None:
+        pair = (int(w_idx), int(s_idx))
+        if pair in seen_pairs:
+            return
+        seen_pairs.add(pair)
+        m = compute_match(wos_df.loc[w_idx].to_dict(), scp_df.loc[s_idx].to_dict())
+        if m is not None:
+            candidates.append((m["confidence"], pair[0], pair[1], m))
+
+    for key_col in ("_norm_doi", "_norm_pmid"):
+        if key_col not in wos_df.columns or key_col not in scp_df.columns:
+            continue
+        w_index: dict = {}
+        for idx in wos_df.index:
+            v = wos_df.at[idx, key_col]
+            if v:
+                w_index.setdefault(v, []).append(int(idx))
+        for idx in scp_df.index:
+            v = scp_df.at[idx, key_col]
+            if not v:
+                continue
+            for w_idx in w_index.get(v, ()):
+                consider(w_idx, int(idx))
+
+    wos_blocks = build_blocks(wos_df)
+    scp_blocks = build_blocks(scp_df)
+    for key in set(wos_blocks.keys()) & set(scp_blocks.keys()):
+        for w_idx in wos_blocks[key]:
+            for s_idx in scp_blocks[key]:
+                consider(w_idx, s_idx)
+
+    candidates.sort(key=lambda x: -x[0])
+    return candidates
+
+
 def smart_merge(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> SmartMergeResult:
     """Merge + deduplicate a WoS and a Scopus DataFrame.
 
@@ -468,20 +553,11 @@ def smart_merge(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> SmartMergeResult:
     _add_norm_columns(wos_df)
     _add_norm_columns(scp_df)
 
-    wos_blocks = build_blocks(wos_df)
-    scp_blocks = build_blocks(scp_df)
-    common_keys = set(wos_blocks.keys()) & set(scp_blocks.keys())
+    wos_raw_n, scp_raw_n = len(wos_df), len(scp_df)
+    wos_df, intra_wos_removed = dedup_within_source(wos_df)
+    scp_df, intra_scp_removed = dedup_within_source(scp_df)
 
-    candidates: list[tuple[float, int, int, dict]] = []
-    for key in common_keys:
-        for w_idx in wos_blocks[key]:
-            w_row = wos_df.loc[w_idx].to_dict()
-            for s_idx in scp_blocks[key]:
-                s_row = scp_df.loc[s_idx].to_dict()
-                m = compute_match(w_row, s_row)
-                if m is not None:
-                    candidates.append((m["confidence"], w_idx, s_idx, m))
-    candidates.sort(key=lambda x: -x[0])
+    candidates = generate_candidates(wos_df, scp_df)
 
     matches: list[dict] = []
     borderline_rows: list[dict] = []
@@ -537,16 +613,18 @@ def smart_merge(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> SmartMergeResult:
 
     final_df = pd.concat([merged_df, wos_not_matched, scp_not_matched], ignore_index=True)
 
-    total_input = len(wos_df) + len(scp_df)
-    duplicates = len(matches)
+    total_input = wos_raw_n + scp_raw_n
+    duplicates = len(matches) + intra_wos_removed + intra_scp_removed
     stats = {
-        "wos_input": int(len(wos_df)),
-        "scopus_input": int(len(scp_df)),
+        "wos_input": int(wos_raw_n),
+        "scopus_input": int(scp_raw_n),
         "total_input": int(total_input),
         "merged_count": int(len(final_df)),
         "duplicates_removed": int(duplicates),
         "dedup_rate": round(duplicates / total_input, 4) if total_input else 0.0,
-        "matched_pairs": int(duplicates),
+        "matched_pairs": int(len(matches)),
+        "intra_wos_removed": int(intra_wos_removed),
+        "intra_scopus_removed": int(intra_scp_removed),
         "borderline_count": int(len(borderline_rows)),
         "lost_wos_count": int(len(wos_not_matched)),
         "lost_scopus_count": int(len(scp_not_matched)),
