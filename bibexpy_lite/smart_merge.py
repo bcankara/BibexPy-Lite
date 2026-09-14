@@ -133,7 +133,7 @@ STOPWORDS: set[str] = {
 _DOI_PREFIX_RE = re.compile(r"^https?://(dx\.)?doi\.org/", re.IGNORECASE)
 # Underscore + the Unicode dash family (hyphen, non-breaking hyphen, figure/en/
 # em/horizontal dash) fold to one canonical '-'.
-_DOI_SEP_RE = re.compile(r"[_‐-―]")
+_DOI_SEP_RE = re.compile(r"[_\u2010-\u2015]")
 _PUNCT_RE = re.compile(r"[^a-z0-9 ]+")
 _WS_RE = re.compile(r"\s+")
 _LATEX_RE = re.compile(r"\\[a-z]+\{[^}]*\}|\\[\\\\&%$#_{}~^]")
