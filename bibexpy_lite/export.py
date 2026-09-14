@@ -1,13 +1,22 @@
-"""Export a merged DataFrame to a Web of Science tagged .txt file.
+"""Export a merged DataFrame for downstream bibliometric tools.
 
-The .txt is consumable by VOSviewer and bibliometrix / biblioshiny, which is
-the usual reason for merging WoS + Scopus. Adapted from the BibexPy core
-(xlsx2vos) to take a DataFrame directly instead of round-tripping through Excel.
+* ``write_vosviewer`` — Web of Science tagged .txt, consumable by VOSviewer and
+  bibliometrix / biblioshiny. Adapted from the BibexPy core (xlsx2vos) to take a
+  DataFrame directly instead of round-tripping through Excel.
+* ``write_excel`` — .xlsx that biblioshiny can import directly (carries SR).
+
+Both mirror the main BibexPy export boundary: cited references are normalized
+to WoS grammar and SR is generated for spreadsheets.
 """
 
 from __future__ import annotations
 
+import re
+from typing import Any
+
 import pandas as pd
+
+from .cr_normalize import count_refs, normalize_cr
 
 # Output tag -> source column. Most are identity; a few map to differently
 # named columns produced by the parsers.
@@ -86,7 +95,10 @@ def write_vosviewer(df: pd.DataFrame, output_txt_path: str) -> None:
             f.write(f"FU {values['FU'][i]}\n")
             f.write(f"FX {values['FX'][i]}\n")
 
-            cr = str(values["CR"][i] or "")
+            # Normalize BEFORE splitting: in Scopus grammar ';' also separates
+            # authors, so a raw split shreds each reference into author
+            # fragments. After normalize_cr ';' is only a reference boundary.
+            cr = normalize_cr(str(values["CR"][i] or ""))
             cr_list = [r.strip() for r in cr.split(";") if r.strip()]
             if cr_list:
                 f.write(f"CR {cr_list[0]}\n")
@@ -95,10 +107,126 @@ def write_vosviewer(df: pd.DataFrame, output_txt_path: str) -> None:
             else:
                 f.write("CR \n")
 
-            for tag in ("NR", "TC", "Z9", "U1", "U2", "PU", "PI", "PA", "SN",
+            # NR blank or 0 next to a non-empty CR: count the references —
+            # readers use NR as the reference count; genuinely reference-less
+            # records have an empty CR anyway.
+            nr = values["NR"][i]
+            if str(nr).strip() in ("", "nan", "NaN", "None", "0", "0.0") and cr:
+                nr = count_refs(cr)
+            f.write(f"NR {nr}\n")
+
+            for tag in ("TC", "Z9", "U1", "U2", "PU", "PI", "PA", "SN",
                         "EI", "J9", "JI", "PD", "PY", "VL", "AR", "DI", "EA",
                         "PG", "WC", "WE", "SC", "GA", "UT", "DA"):
                 f.write(f"{tag} {values[tag][i]}\n")
 
             f.write("ER\n\n")
         f.write("EF\n")
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  SR (Short Reference) — bibliometrix / biblioshiny compatibility
+# ════════════════════════════════════════════════════════════════════════
+# Vendored from the main BibexPy export boundary (apps/api/services/exporter.py).
+
+def _blank(v: Any) -> bool:
+    s = str(v).strip()
+    return s == "" or s.upper() in ("NAN", "NONE", "NA")
+
+
+def _fmt_year(v: Any) -> str:
+    """Render PY the way R's paste() would: 2020.0 -> "2020"."""
+    if _blank(v):
+        return "NA"
+    try:
+        f = float(v)
+        if f.is_integer():
+            return str(int(f))
+    except (TypeError, ValueError):
+        pass
+    return str(v).strip()
+
+
+def _first_author(au: Any) -> str:
+    """First ';' part of AU with commas turned into spaces (bibliometrix SR())."""
+    if _blank(au):
+        return "NA"
+    first = str(au).split(";")[0].strip().replace(",", " ")
+    first = re.sub(r"\s+", " ", first).strip()
+    return first or "NA"
+
+
+def _sr_source(row: pd.Series, has_j9: bool, has_ji: bool, has_so: bool) -> str:
+    """Source abbreviation: J9 -> (SO when J9 and JI are both blank) -> JI with
+    dots as spaces. Without a J9 column: JI, else SO — the same priority chain
+    as bibliometrix SR()."""
+    j9 = row.get("J9") if has_j9 else None
+    ji = row.get("JI") if has_ji else None
+    so = row.get("SO") if has_so else None
+    if has_j9:
+        if not _blank(j9):
+            return str(j9).strip()
+        if _blank(ji):
+            return "" if _blank(so) else str(so).strip()
+        return re.sub(r"\s+", " ", str(ji).replace(".", " ")).strip()
+    val = ji if not _blank(ji) else so
+    if _blank(val):
+        return ""
+    return re.sub(r"\s+", " ", str(val).replace(".", " ")).strip()
+
+
+def ensure_sr(df: pd.DataFrame) -> pd.DataFrame:
+    """Add SR / SR_FULL when missing (faithful to bibliometrix
+    ``metaTagExtraction(Field="SR")``).
+
+    biblioshiny does NOT run convert2df when importing an xlsx/csv: it reads the
+    file raw and assumes SR already exists (``wcTable`` does an unguarded
+    ``rep(M$SR, lengths(WC))`` and loading crashes with "differing number of
+    rows: 0, N" without it). Format "SURNAME IN, YEAR, SOURCE"; duplicates get
+    bibliometrix's ITERATIVE suffixes (three copies -> X, X-a, X-a-b).
+    """
+    if "SR" in df.columns and df["SR"].astype(str).str.strip().ne("").any():
+        return df
+    if "AU" not in df.columns:
+        return df  # SR cannot be built; biblioshiny could not use the data anyway
+
+    has_j9 = "J9" in df.columns
+    has_ji = "JI" in df.columns
+    has_so = "SO" in df.columns
+
+    parts = []
+    for _, row in df.iterrows():
+        fa = _first_author(row.get("AU"))
+        py = _fmt_year(row.get("PY")) if "PY" in df.columns else "NA"
+        src = _sr_source(row, has_j9, has_ji, has_so)
+        sr = f"{fa}, {py}, {src}" if src else f"{fa}, {py}"
+        parts.append(re.sub(r"\s+", " ", sr).strip())
+
+    sr_full = list(parts)
+    # bibliometrix's compounding suffix loop: each round appends -a, then -b ...
+    # to whatever is still duplicated.
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    sr = list(parts)
+    for i in range(len(letters)):
+        seen: set = set()
+        dup_idx = []
+        for idx, v in enumerate(sr):
+            if v in seen:
+                dup_idx.append(idx)
+            else:
+                seen.add(v)
+        if not dup_idx:
+            break
+        for idx in dup_idx:
+            sr[idx] = f"{sr[idx]}-{letters[i]}"
+
+    out = df.copy(deep=False)
+    out["SR"] = sr
+    if "SR_FULL" not in out.columns:
+        out["SR_FULL"] = sr_full
+    return out
+
+
+def write_excel(df: pd.DataFrame, output_xlsx_path: str) -> None:
+    """Write `df` as .xlsx that biblioshiny can import directly (SR included)."""
+    ensure_sr(df).to_excel(output_xlsx_path, index=False)

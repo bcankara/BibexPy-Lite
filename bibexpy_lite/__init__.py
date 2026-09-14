@@ -2,12 +2,12 @@
 exports with the BibexPy Smart Merge algorithm (DOI-determinative dedup).
 
 Public API:
-    from bibexpy_lite import smart_merge, read_wos, read_scopus, write_vosviewer
+    from bibexpy_lite import smart_merge, read_wos, read_scopus, write_excel, write_vosviewer
 """
 
 from .smart_merge import SmartMergeResult, smart_merge
 from .parsers import read_scopus, read_wos
-from .export import write_vosviewer
+from .export import write_excel, write_vosviewer
 
-__all__ = ["smart_merge", "SmartMergeResult", "read_wos", "read_scopus", "write_vosviewer"]
-__version__ = "1.1.1"
+__all__ = ["smart_merge", "SmartMergeResult", "read_wos", "read_scopus", "write_excel", "write_vosviewer"]
+__version__ = "1.2.0"

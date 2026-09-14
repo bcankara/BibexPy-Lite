@@ -23,6 +23,8 @@ from typing import Any, Optional
 
 import pandas as pd
 
+from .cr_normalize import count_refs, normalize_cr
+
 
 # ════════════════════════════════════════════════════════════════════════
 #  String similarity (vendored from the main package)
@@ -129,6 +131,9 @@ STOPWORDS: set[str] = {
 }
 
 _DOI_PREFIX_RE = re.compile(r"^https?://(dx\.)?doi\.org/", re.IGNORECASE)
+# Underscore + the Unicode dash family (hyphen, non-breaking hyphen, figure/en/
+# em/horizontal dash) fold to one canonical '-'.
+_DOI_SEP_RE = re.compile(r"[_‐-―]")
 _PUNCT_RE = re.compile(r"[^a-z0-9 ]+")
 _WS_RE = re.compile(r"\s+")
 _LATEX_RE = re.compile(r"\\[a-z]+\{[^}]*\}|\\[\\\\&%$#_{}~^]")
@@ -173,6 +178,11 @@ def normalize_doi(raw: Any) -> Optional[str]:
         if s == prev:
             break
     s = s.rstrip("/. \t")
+    # Separator folding: DOIs are compared in CANONICAL form because indexers
+    # render separators differently — WoS lists an article as
+    # '10.4103/jgid.jgid_12_19', Scopus as '10.4103/jgid.jgid-12-19'. Without
+    # folding the pair is not merely missed: doi_conflict() vetoes it outright.
+    s = _DOI_SEP_RE.sub("-", s)
     if not s.startswith("10."):
         return None
     return s
@@ -265,9 +275,9 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
     # conflicts only reject when no higher identifier can be compared.
     w_doi = w.get("_norm_doi")
     s_doi = s.get("_norm_doi")
-    if w_doi and s_doi and w_doi != s_doi:
-        return None
-    if w_doi and s_doi and w_doi == s_doi:
+    if w_doi and s_doi:
+        if w_doi != s_doi:
+            return None
         return {
             "stage": "1_doi_exact", "stage_label": "DOI exact", "confidence": 1.00,
             "reason": f"DOI exact: {w_doi}",
@@ -277,9 +287,9 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
     # PMID (when DOIs could not be compared): conflict -> reject; equal -> merge
     w_pmid = w.get("_norm_pmid")
     s_pmid = s.get("_norm_pmid")
-    if w_pmid and s_pmid and w_pmid != s_pmid:
-        return None
-    if w_pmid and s_pmid and w_pmid == s_pmid:
+    if w_pmid and s_pmid:
+        if w_pmid != s_pmid:
+            return None
         return {
             "stage": "2_pmid_exact", "stage_label": "PMID exact", "confidence": 0.99,
             "reason": f"PMID exact: {w_pmid}",
@@ -479,12 +489,18 @@ def dedup_within_source(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """
     if df.empty:
         return df, 0
-    richness = df.notna().sum(axis=1) + (df.astype(str) != "").sum(axis=1)
+    # Richness is accumulated column by column: df.astype(str) would materialize
+    # a string copy of the whole frame at once (hundreds of MB on a large
+    # corpus); the per-column sum gives the same score with a far lower peak.
+    richness = pd.Series(0, index=df.index, dtype="int64")
+    for col in df.columns:
+        s = df[col]
+        richness += s.notna().astype("int64") + (s.astype(str) != "").astype("int64")
     drop: set = set()
     for key_col in ("_norm_ut", "_norm_doi"):
         if key_col not in df.columns:
             continue
-        best_for: dict = {}
+        best_for: dict[str, Any] = {}
         for idx in df.index:
             if idx in drop:
                 continue
@@ -531,7 +547,7 @@ def generate_candidates(
     for key_col in ("_norm_doi", "_norm_pmid"):
         if key_col not in wos_df.columns or key_col not in scp_df.columns:
             continue
-        w_index: dict = {}
+        w_index: dict[str, list[int]] = {}
         for idx in wos_df.index:
             v = wos_df.at[idx, key_col]
             if v:
@@ -628,6 +644,35 @@ def smart_merge(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> SmartMergeResult:
 
     final_df = pd.concat([merged_df, wos_not_matched, scp_not_matched], ignore_index=True)
 
+    # CR normalization — Scopus-grammar cited references are rewritten into
+    # WoS grammar. Otherwise VOSviewer / bibliometrix cannot match any reference
+    # of the Scopus-sourced rows (Scopus separates authors AND references with
+    # ';', so every reference is shredded into author fragments). normalize_cr
+    # is idempotent; comma-less WoS rows pass through unchanged.
+    cr_normalized = nr_filled = 0
+    if "CR" in final_df.columns:
+        before = final_df["CR"].fillna("").astype(str)
+        after = before.map(normalize_cr)
+        filled_cr = before.str.strip() != ""
+        changed = filled_cr & (after != before)
+        cr_normalized = int(changed.sum())
+        if changed.any():
+            final_df["CR"] = final_df["CR"].astype(object)
+            final_df.loc[changed, "CR"] = after[changed]
+        # NR (reference count): count from CR when blank OR when CR was rewritten
+        # here. Scopus exports have no NR, and on matched pairs whose CR fell back
+        # to the Scopus side the WoS NR (often 0) no longer describes the string.
+        if "NR" not in final_df.columns:
+            final_df["NR"] = ""
+        nr = final_df["NR"]
+        blank = nr.isna() | nr.astype(str).str.strip().isin(("", "nan", "NaN", "None"))
+        fill = (blank | changed) & filled_cr
+        if fill.any():
+            # object dtype: writing ints into a float column yields "NR 3.0".
+            final_df["NR"] = final_df["NR"].astype(object)
+            final_df.loc[fill, "NR"] = after[fill].map(count_refs)
+            nr_filled = int(fill.sum())
+
     total_input = wos_raw_n + scp_raw_n
     duplicates = len(matches) + intra_wos_removed + intra_scp_removed
     stats = {
@@ -644,6 +689,8 @@ def smart_merge(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> SmartMergeResult:
         "lost_wos_count": int(len(wos_not_matched)),
         "lost_scopus_count": int(len(scp_not_matched)),
         "conflict_count": int(len(conflicts)),
+        "cr_normalized": cr_normalized,
+        "nr_filled": nr_filled,
     }
 
     return SmartMergeResult(

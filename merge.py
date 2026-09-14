@@ -27,7 +27,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from bibexpy_lite import read_scopus, read_wos, smart_merge, write_vosviewer
+from bibexpy_lite import read_scopus, read_wos, smart_merge, write_excel, write_vosviewer
 
 try:
     from colorama import Fore, Style, init as _color_init
@@ -98,7 +98,7 @@ def run_project(project_dir: str) -> str:
 
     merged_xlsx = os.path.join(out_dir, "Merged.xlsx")
     merged_txt = os.path.join(out_dir, "Merged_Vos.txt")
-    res.merged.to_excel(merged_xlsx, index=False)
+    write_excel(res.merged, merged_xlsx)
     write_vosviewer(res.merged, merged_txt)
 
     if not res.borderline.empty:
@@ -122,12 +122,13 @@ def run_project(project_dir: str) -> str:
     print(f"  Unique records    : {s['merged_count']}")
     print(f"  Borderline (kept separate, review): {s['borderline_count']}")
     print(f"  Lost (WoS / Scopus): {s['lost_wos_count']} / {s['lost_scopus_count']}")
+    print(f"  Cited references normalized (Scopus -> WoS grammar): {s['cr_normalized']}")
     if res.match_stages:
         print("  Match stages:")
         for label, n in sorted(res.match_stages.items(), key=lambda x: -x[1]):
             print(f"    - {label}: {n}")
     _ok(f"\nOutput folder: {out_dir}")
-    print("  - Merged.xlsx           (deduplicated dataset)")
+    print("  - Merged.xlsx           (deduplicated dataset, biblioshiny-ready)")
     print("  - Merged_Vos.txt        (VOSviewer / biblioshiny)")
     if s["borderline_count"]:
         print("  - Borderline_Uncertain.xlsx (uncertain pairs kept separate)")

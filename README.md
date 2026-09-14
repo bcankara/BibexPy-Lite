@@ -30,7 +30,8 @@ app: same merge algorithm, no web UI, no API/ML enrichment — ideal for a quick
 run in Google Colab or a terminal, the way BibexPy v1 worked.
 
 > **What it does:** read raw WoS `.txt` + Scopus `.csv` → merge & deduplicate →
-> write `Merged.xlsx` and a VOSviewer / biblioshiny-ready `Merged_Vos.txt`.
+> write a biblioshiny-ready `Merged.xlsx` and a VOSviewer / biblioshiny-ready
+> `Merged_Vos.txt`.
 > **What it does NOT do:** enrichment, APIs, filtering, harmonization, reporting.
 > For those, use the full BibexPy app.
 
@@ -47,6 +48,12 @@ from Web of Science).
 
 Uncertain pairs (title similarity 0.80–0.92) are **kept separate** and written
 to `Borderline_Uncertain.xlsx` for you to review manually.
+
+**Cited references are normalized:** Scopus-format references are rewritten
+into Web of Science grammar (`AUTHOR IN, YEAR, SOURCE, Vn, Pn`) and WoS author
+spellings are unified, so VOSviewer can match references across both sources
+in citation, co-citation and bibliographic coupling networks. Missing `NR`
+(reference counts) are filled in.
 
 ---
 
@@ -87,7 +94,7 @@ results are written to `Workspace/My Project/Analysis_<timestamp>/`:
 
 | File | Description |
 |------|-------------|
-| `Merged.xlsx` | Final deduplicated dataset |
+| `Merged.xlsx` | Final deduplicated dataset (includes `SR` / `SR_FULL`, so biblioshiny can import it directly) |
 | `Merged_Vos.txt` | WoS-tagged text for VOSviewer / biblioshiny |
 | `Borderline_Uncertain.xlsx` | Uncertain pairs kept separate (review) |
 | `Conflict_Log.xlsx` | Field conflicts resolved during merge |
@@ -97,13 +104,14 @@ results are written to `Workspace/My Project/Analysis_<timestamp>/`:
 ## Use as a library
 
 ```python
-from bibexpy_lite import read_wos, read_scopus, smart_merge
+from bibexpy_lite import read_wos, read_scopus, smart_merge, write_excel, write_vosviewer
 
 wos = read_wos("Workspace/My Project/Data/savedrecs.txt")
 scp = read_scopus("Workspace/My Project/Data/scopus.csv")
 res = smart_merge(wos, scp)
 
-res.merged.to_excel("merged.xlsx", index=False)
+write_excel(res.merged, "merged.xlsx")          # adds SR for biblioshiny
+write_vosviewer(res.merged, "merged_vos.txt")   # WoS-tagged text for VOSviewer
 print(res.stats)            # counts: duplicates_removed, merged_count, ...
 print(res.borderline)       # uncertain pairs
 ```
@@ -116,8 +124,10 @@ The Smart Merge algorithm here (`bibexpy_lite/smart_merge.py`) is a **vendored
 copy** of the canonical implementation in
 [BibexPy](https://github.com/bcankara/BibexPy) (`apps/api/services/smart_merger.py`).
 The algorithm is the single source of truth there; this repo keeps a copy so it
-can run with no web dependencies. They are kept in sync and produce identical
-merge results.
+can run with no web dependencies. They are kept in sync (manually — there is no
+automatic sync between the repositories) and produce identical merge results.
+`bibexpy_lite/cr_normalize.py` is likewise an unmodified copy of BibexPy's
+`packages/bibex_core/cr_normalize.py`.
 
 ## Citation
 
