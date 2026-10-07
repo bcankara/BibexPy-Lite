@@ -6,7 +6,11 @@ title+year+surname, journal+volume+page, borderline) -> field merge with fixed
 per-field source preferences.
 
 DOI is determinative: two records whose normalized DOIs differ are never the
-same publication (no auto-merge, no borderline).
+same publication (no auto-merge, no borderline). The one exception is a DOI that
+two indexers wrote with different separators ("jogh.12-05057" vs
+"JOGH.12.05057"): that only lifts the veto, the DOI is not counted as evidence,
+and the pair must still match on PMID, title+year+surname or
+journal+volume+pages.
 
 This is a vendored copy of the canonical algorithm in the main BibexPy package
 (apps/api/services/smart_merger.py). Keep the two in sync — the algorithm is the
@@ -282,11 +286,78 @@ def build_blocks(df: pd.DataFrame) -> dict[tuple[Optional[int], str], list[int]]
 #  Multi-stage matching
 # ════════════════════════════════════════════════════════════════════════
 
+_DOI_SEP_CHARS = frozenset("-._")
+
+
+def _doi_sep_profile(suffix: str) -> tuple[str, dict[int, str]]:
+    """Split a DOI suffix into (separator-free core, position -> separators)."""
+    core: list[str] = []
+    gaps: dict[int, str] = {}
+    for ch in suffix:
+        if ch in _DOI_SEP_CHARS:
+            gaps[len(core)] = gaps.get(len(core), "") + ch
+        else:
+            core.append(ch)
+    return "".join(core), gaps
+
+
+def doi_separator_variants(canon_a: Optional[str], canon_b: Optional[str]) -> bool:
+    """Do two CANONICAL DOIs differ only in how their separators were written?
+
+    The DOI-determinative rule stays: records whose normalized DOIs differ are
+    different publications. The one exception is an indexer writing the same
+    DOI differently - '10.7189/jogh.12-05057' and '10.7189/JOGH.12.05057' are
+    the same article. Such a pair is not vetoed, but the DOI is NOT evidence:
+    the pair has to earn its match in the later stages (never Stage 1).
+
+    The rule is deliberately narrow. Deleting every separator and comparing
+    the rest equates real, DIFFERENT papers: in Physical Review the
+    volume|page boundary shifts - '.../physrevc.5.350' (Michaud 1972, vol 5,
+    p 350) and '.../physrevc.53.50' (Awasthi 1996, vol 53, p 50) are both
+    registered. So:
+      * the registrant prefix (before the first '/') must be identical,
+      * the separator-free core must be identical,
+      * every differing separator position must be a 1:1 substitution
+        (- / . / _) or an insertion/deletion at an inner boundary with at
+        least one non-digit neighbour.
+    Insertion/deletion between two digits, at either edge, and '--' vs '-'
+    are rejected.
+    """
+    if not canon_a or not canon_b or canon_a == canon_b:
+        return False
+    pa, _, sa = canon_a.partition("/")
+    pb, _, sb = canon_b.partition("/")
+    if pa != pb or not sa or not sb:
+        return False
+    ca, ga = _doi_sep_profile(sa)
+    cb, gb = _doi_sep_profile(sb)
+    if ca != cb:
+        return False
+    for i in set(ga) | set(gb):
+        x, y = ga.get(i, ""), gb.get(i, "")
+        if x == y:
+            continue
+        if len(x) == 1 and len(y) == 1:
+            continue                      # 1:1 substitution: safe
+        if len(x) > 1 or len(y) > 1:
+            return False                  # '--' vs '-'
+        if i == 0 or i == len(ca):
+            return False                  # insertion/deletion at an edge
+        if ca[i - 1].isdigit() and ca[i].isdigit():
+            return False                  # digit|digit: segmentation shift
+    return True
+
+
 def doi_conflict(raw_a: Any, raw_b: Any) -> bool:
-    """True if both raw DOIs normalize to present-but-different values."""
+    """True if both raw DOIs normalize to present-but-different values.
+
+    A pair that differs only in separator spelling is not a conflict.
+    """
     a = normalize_doi(raw_a)
     b = normalize_doi(raw_b)
-    return bool(a and b and a != b)
+    if not a or not b or a == b:
+        return False
+    return not doi_separator_variants(a, b)
 
 
 def compute_match(w: dict, s: dict) -> Optional[dict]:
@@ -296,9 +367,14 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
     # conflicts only reject when no higher identifier can be compared.
     w_doi = w.get("_norm_doi")
     s_doi = s.get("_norm_doi")
-    if _present(w_doi) and _present(s_doi):
-        if w_doi != s_doi:
+    doi_note = ""
+    if _present(w_doi) and _present(s_doi) and w_doi != s_doi:
+        if not doi_separator_variants(w_doi, s_doi):
             return None
+        # Separator spelling only: the veto is lifted but the DOI is not
+        # evidence. The pair must pass the stages below - never Stage 1.
+        doi_note = f" | DOI spelling differs: {w_doi} <-> {s_doi}"
+    elif _present(w_doi) and _present(s_doi):
         return {
             "stage": "1_doi_exact", "stage_label": "DOI exact", "confidence": 1.00,
             "reason": f"DOI exact: {w_doi}",
@@ -350,7 +426,7 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
             return {
                 "stage": "3_title_year_surname", "stage_label": "Title+Year+Surname",
                 "confidence": 0.95,
-                "reason": f"JW(title)={jw_title:.3f} >= {TITLE_EXACT_THRESHOLD}, year_diff={year_diff}, surname='{w_surname}'",
+                "reason": f"JW(title)={jw_title:.3f} >= {TITLE_EXACT_THRESHOLD}, year_diff={year_diff}, surname='{w_surname}'" + doi_note,
                 "jw_title": round(jw_title, 4), "year_diff": year_diff, "surname_match": surname_match,
             }
 
@@ -374,7 +450,7 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
                 return {
                     "stage": "4_journal_vol_page", "stage_label": "Journal+Vol+Pages",
                     "confidence": 0.90,
-                    "reason": f"JW(journal)={jw_journal:.3f}, vol={w_vol}, page_match=True",
+                    "reason": f"JW(journal)={jw_journal:.3f}, vol={w_vol}, page_match=True" + doi_note,
                     "jw_title": round(jw_title, 4), "year_diff": year_diff, "surname_match": surname_match,
                 }
 
@@ -384,7 +460,7 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
             return {
                 "stage": "5_borderline", "stage_label": "Borderline (manual review)",
                 "confidence": round(conf, 3),
-                "reason": f"JW(title)={jw_title:.3f}, year_diff={year_diff}, surname_match={surname_match}",
+                "reason": f"JW(title)={jw_title:.3f}, year_diff={year_diff}, surname_match={surname_match}" + doi_note,
                 "jw_title": round(jw_title, 4), "year_diff": year_diff, "surname_match": surname_match,
             }
 
@@ -591,12 +667,22 @@ def generate_candidates(
             for w_idx in w_index.get(v, ()):
                 consider(w_idx, int(idx))
 
+    # Blocking scopes the title stages. The block key wants the EXACT year,
+    # so Stage 3's +-1 year tolerance never fired: early-access vs print-year
+    # pairs were not even candidates. Each WoS block is now also compared with
+    # the Scopus blocks of the neighbouring years (one-sided: ~3x candidates,
+    # not 9x). Records without a year keep the old behaviour.
     wos_blocks = build_blocks(wos_df)
     scp_blocks = build_blocks(scp_df)
-    for key in set(wos_blocks.keys()) & set(scp_blocks.keys()):
-        for w_idx in wos_blocks[key]:
-            for s_idx in scp_blocks[key]:
-                consider(w_idx, s_idx)
+    for (year, letter), w_idxs in wos_blocks.items():
+        years = (year,) if year is None else (year - 1, year, year + 1)
+        for y in years:
+            s_idxs = scp_blocks.get((y, letter))
+            if not s_idxs:
+                continue
+            for w_idx in w_idxs:
+                for s_idx in s_idxs:
+                    consider(w_idx, s_idx)
 
     candidates.sort(key=lambda x: -x[0])
     return candidates

@@ -42,7 +42,12 @@ run in Google Colab or a terminal, the way BibexPy v1 worked.
 Records are matched in stages: **negative rules → DOI exact → PMID exact →
 Title+Year+Surname → Journal+Volume+Pages → borderline**. **DOI is
 determinative** — two records whose normalized DOIs differ are *never* the same
-publication (no auto-merge, no false dedup). Field values are combined with
+publication (no auto-merge, no false dedup). The one exception is a DOI that two
+indexers wrote with different separators, such as `jogh.12-05057` vs
+`JOGH.12.05057`: that only lifts the veto — the DOI is not counted as evidence,
+so the pair must still match on PMID, title + year + first author, or journal +
+volume + pages. Candidate pairs are compared across neighbouring years, so a
+record indexed a year apart (early access vs print) is still found. Field values are combined with
 fixed per-field source preferences (e.g. abstract/authors from Scopus, citations
 from Web of Science).
 
