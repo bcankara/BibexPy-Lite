@@ -155,6 +155,27 @@ def _to_str(v: Any) -> str:
     return str(v).strip()
 
 
+def _present(v: Any) -> bool:
+    """Is this IDENTITY value really filled in? (None / NaN / "" / "nan" -> False)
+
+    "Empty" takes three shapes depending on the pandas version: None (object
+    dtype), NaN (pandas 3's `str` dtype — and NaN is TRUTHY), and "" / "nan"
+    (an xlsx round-trip). A bare `if v` accepts NaN as a real identifier and
+    therefore treats all identifier-less records as equal to one another, which
+    collapses them onto a single key and deletes every one but the richest.
+    Identity comparisons (DOI/PMID/UT/ISSN) use ONLY this helper.
+    """
+    if v is None:
+        return False
+    try:
+        if pd.isna(v):
+            return False
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    return s != "" and s.lower() not in ("nan", "none", "null")
+
+
 def _clean_num(v: Any) -> str:
     """Comparison form for numeric fields (VL/BP/PG): '100.0' -> '100'."""
     s = _to_str(v)
@@ -275,7 +296,7 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
     # conflicts only reject when no higher identifier can be compared.
     w_doi = w.get("_norm_doi")
     s_doi = s.get("_norm_doi")
-    if w_doi and s_doi:
+    if _present(w_doi) and _present(s_doi):
         if w_doi != s_doi:
             return None
         return {
@@ -287,7 +308,7 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
     # PMID (when DOIs could not be compared): conflict -> reject; equal -> merge
     w_pmid = w.get("_norm_pmid")
     s_pmid = s.get("_norm_pmid")
-    if w_pmid and s_pmid:
+    if _present(w_pmid) and _present(s_pmid):
         if w_pmid != s_pmid:
             return None
         return {
@@ -299,7 +320,7 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
     # ISSN (journal-level guard): only vetoes the title-based stages
     w_issn = w.get("_norm_issn")
     s_issn = s.get("_norm_issn")
-    if w_issn and s_issn and w_issn != s_issn:
+    if _present(w_issn) and _present(s_issn) and w_issn != s_issn:
         return None
 
     # Stage 3 — Title JW + Year +-1 + Surname
@@ -469,14 +490,25 @@ class SmartMergeResult:
 
 def _add_norm_columns(df: pd.DataFrame) -> None:
     n = len(df)
-    df["_norm_doi"] = df.get("DI", pd.Series([""] * n, index=df.index)).apply(normalize_doi)
-    df["_norm_title"] = df.get("TI", pd.Series([""] * n, index=df.index)).apply(normalize_title)
-    df["_norm_year"] = df.get("PY", pd.Series([""] * n, index=df.index)).apply(normalize_year)
-    df["_norm_surname"] = df.get("AU", pd.Series([""] * n, index=df.index)).apply(normalize_author_surname)
-    df["_norm_issn"] = df.get("SN", pd.Series([""] * n, index=df.index)).apply(normalize_issn)
-    df["_norm_pmid"] = df.get("PM", pd.Series([""] * n, index=df.index)).apply(normalize_id_token)
-    df["_norm_ut"] = df.get("UT", pd.Series([""] * n, index=df.index)).apply(normalize_id_token)
-    df["_norm_journal"] = df.get("SO", pd.Series([""] * n, index=df.index)).apply(normalize_title)
+    # Columns are built from a LIST with dtype=object — never `.apply()`.
+    # Under pandas 3 a text-returning apply() yields a `str` dtype column and
+    # turns the None that means "empty" into NaN. NaN is truthy, so every
+    # identity guard accepts it: all identifier-less rows of a source collapse
+    # onto one key and only the richest survives (SILENT DATA LOSS), and such
+    # records can no longer match anything. `astype(object)` does NOT fix this:
+    # NaN stays NaN inside object dtype and stays truthy.
+    def _col(src: str, fn) -> pd.Series:
+        raw = df[src] if src in df.columns else pd.Series([""] * n, index=df.index)
+        return pd.Series([fn(v) for v in raw], index=df.index, dtype=object)
+
+    df["_norm_doi"] = _col("DI", normalize_doi)
+    df["_norm_title"] = _col("TI", normalize_title)
+    df["_norm_year"] = _col("PY", normalize_year)
+    df["_norm_surname"] = _col("AU", normalize_author_surname)
+    df["_norm_issn"] = _col("SN", normalize_issn)
+    df["_norm_pmid"] = _col("PM", normalize_id_token)
+    df["_norm_ut"] = _col("UT", normalize_id_token)
+    df["_norm_journal"] = _col("SO", normalize_title)
 
 
 def dedup_within_source(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -505,7 +537,7 @@ def dedup_within_source(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
             if idx in drop:
                 continue
             v = df.at[idx, key_col]
-            if not v:
+            if not _present(v):
                 continue
             prev = best_for.get(v)
             if prev is None:
@@ -550,11 +582,11 @@ def generate_candidates(
         w_index: dict[str, list[int]] = {}
         for idx in wos_df.index:
             v = wos_df.at[idx, key_col]
-            if v:
+            if _present(v):
                 w_index.setdefault(v, []).append(int(idx))
         for idx in scp_df.index:
             v = scp_df.at[idx, key_col]
-            if not v:
+            if not _present(v):
                 continue
             for w_idx in w_index.get(v, ()):
                 consider(w_idx, int(idx))
