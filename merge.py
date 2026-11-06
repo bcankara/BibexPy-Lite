@@ -129,9 +129,11 @@ def run_project(project_dir: str) -> str:
             print(f"    - {label}: {n}")
     _ok(f"\nOutput folder: {out_dir}")
     print("  - Merged.xlsx           (deduplicated dataset, biblioshiny-ready)")
+    print("      starts with a UID column (record key 1..N)")
     print("  - Merged_Vos.txt        (VOSviewer / biblioshiny)")
     if s["borderline_count"]:
         print("  - Borderline_Uncertain.xlsx (uncertain pairs kept separate)")
+        print("      wos_uid / scp_uid = the UIDs of both rows in Merged.xlsx")
     print("  - Statistics.xlsx")
     return out_dir
 

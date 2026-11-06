@@ -83,7 +83,9 @@ def isi2df(lines: List[str]) -> pd.DataFrame:
 
     di_col = df["DI"].copy() if "DI" in df.columns else None
     for col in df.columns:
-        if df[col].dtype == "object":
+        # object OR pandas string dtype (pandas 3 reads text as 'str'); cell-wise
+        # Python str.upper keeps the result identical on every pandas version.
+        if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
             df[col] = df[col].apply(lambda x: str(x).upper() if pd.notnull(x) else x)
     if di_col is not None:
         df["DI"] = di_col
@@ -124,6 +126,16 @@ _SCOPUS_TAGS = [
     ("Language of Original Document", "LA"), ("Document Type", "DT"),
     ("Source", "DB"), ("EID", "UT"),
 ]
+
+
+def _is_text_dtype(s: pd.Series) -> bool:
+    """True for object columns and pandas string columns (pandas 2 and 3)."""
+    return pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s)
+
+
+def _upper_str_cell(x):
+    """Python str.upper on string cells only; anything else is returned as is."""
+    return x.upper() if isinstance(x, str) else x
 
 
 def _abbrev_title(title: str) -> str:
@@ -171,8 +183,10 @@ def csvScopus2df(files: Union[str, List[str]]) -> pd.DataFrame:
     di_values = DATA.get("DI", None)
     url_values = DATA.get("URL", None)
     for col in DATA.columns:
-        if DATA[col].dtype == "object":
-            DATA[col] = DATA[col].str.upper()
+        # Gate on object OR pandas string dtype and upper-case with Python's
+        # str.upper ("ß" -> "SS" on every pandas version); non-strings unchanged.
+        if _is_text_dtype(DATA[col]):
+            DATA[col] = DATA[col].map(_upper_str_cell)
     if di_values is not None:
         DATA["DI"] = di_values
     if url_values is not None:

@@ -10,4 +10,4 @@ from .parsers import read_scopus, read_wos
 from .export import write_excel, write_vosviewer
 
 __all__ = ["smart_merge", "SmartMergeResult", "read_wos", "read_scopus", "write_excel", "write_vosviewer"]
-__version__ = "1.3.0"
+__version__ = "1.4.0"

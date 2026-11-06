@@ -99,11 +99,11 @@ results are written to `Workspace/My Project/Analysis_<timestamp>/`:
 
 | File | Description |
 |------|-------------|
-| `Merged.xlsx` | Final deduplicated dataset (includes `SR` / `SR_FULL`, so biblioshiny can import it directly) |
+| `Merged.xlsx` | Final deduplicated dataset (includes `SR` / `SR_FULL`, so biblioshiny can import it directly). Starts with a `UID` column: a sequential record key 1..N, numbered like BibexPy 2.4 on the same input and assigned once per run |
 | `Merged_Vos.txt` | WoS-tagged text for VOSviewer / biblioshiny |
-| `Borderline_Uncertain.xlsx` | Uncertain pairs kept separate (review) |
+| `Borderline_Uncertain.xlsx` | Uncertain pairs kept separate (review); `wos_uid` / `scp_uid` are the `UID`s of both rows in `Merged.xlsx` |
 | `Conflict_Log.xlsx` | Field conflicts resolved during merge |
-| `Lost_WoS.xlsx` / `Lost_Scopus.xlsx` | Records with no match |
+| `Lost_WoS.xlsx` / `Lost_Scopus.xlsx` | Records with no match (`UID` = their key in `Merged.xlsx`) |
 | `Statistics.xlsx` | Summary counts |
 
 ## Use as a library
@@ -122,6 +122,15 @@ print(res.borderline)       # uncertain pairs
 ```
 
 ---
+
+## Python and pandas support
+
+BibexPy-Lite 1.4.x runs on both pandas 2.2+ and pandas 3 and gives identical results on either
+(same merged records, same upper-casing, same column order). pandas 2 is no longer developed
+(the last release, 2.3.3, came out in September 2025) and has no installers for Python 3.15
+and later. This is a transition period: 1.4.x keeps supporting pandas 2 for now, but a later
+Lite release, together with BibexPy 2.5, will require pandas 3 and therefore Python 3.11 or
+newer. If you are on Python 3.10, you can keep using 1.4.x.
 
 ## Relationship to the main BibexPy
 

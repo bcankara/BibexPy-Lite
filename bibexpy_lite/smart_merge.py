@@ -16,6 +16,12 @@ This is a vendored copy of the canonical algorithm in the main BibexPy package
 (apps/api/services/smart_merger.py). Keep the two in sync — the algorithm is the
 single source of truth; this file only strips the web/storage layer so the
 merge can run headless (terminal / Colab) on plain DataFrames.
+
+Record keys: every final record gets a sequential integer key in the UID column
+(1..N, in the order merged pairs, unmatched WoS, unmatched Scopus), identical to
+the numbering BibexPy 2.4 assigns on the same input. Source rows carry temporary
+ids ("w0".., "s0"..) only while the merge runs; the final keys are assigned once,
+and Borderline_Uncertain (wos_uid/scp_uid) and the Lost_* frames refer to them.
 """
 
 from __future__ import annotations
@@ -109,10 +115,18 @@ def name_initials(full: str) -> tuple[str, str]:
 #  Field preferences + thresholds
 # ════════════════════════════════════════════════════════════════════════
 
+# BibexPy's record key column (sequential int64 1..N, assigned once per run)
+UID_COL = "UID"
+
 FIELD_PREFERENCES: dict[str, str] = {
     "TC": "wos",          # times cited
     "CR": "wos",          # cited references
     "NR": "wos",          # number of references
+    # Row identity: while matching, every source row carries a TEMPORARY id ("w3" / "s7",
+    # never persisted); a matched pair keeps the WoS row's id (merge_pair_with_preferences
+    # handles it without logging a conflict). The final sequential keys 1..N are assigned
+    # when the final frame is assembled (_assign_final_keys).
+    "UID": "wos",
     "AB": "scopus",       # abstract
     "AU": "scopus",       # author short
     "AF": "scopus",       # author full
@@ -361,45 +375,71 @@ def doi_conflict(raw_a: Any, raw_b: Any) -> bool:
 
 
 def compute_match(w: dict, s: dict) -> Optional[dict]:
-    # Identifier HIERARCHY: DOI > PMID > ISSN. An exact match at a higher
-    # level overrides conflicts below it (WoS ships the print ISSN, Scopus the
-    # e-ISSN — an ISSN difference must not veto a same-DOI pair). Lower-level
-    # conflicts only reject when no higher identifier can be compared.
+    """5-stage matching decision.
+
+    Returns: None (no match) or {stage, stage_label, confidence, reason, doi, doi_variant,
+    jw_title, year_diff, surname_match}
+    """
+    # ── Identifier HIERARCHY: DOI > PMID > ISSN ───────────────────────────
+    # A DEFINITE equality at a higher level overrides a contradiction at a lower
+    # level. E.g. WoS gives the print-ISSN, Scopus the e-ISSN — an ISSN
+    # contradiction cannot veto a pair with the same DOI (old behavior:
+    # negative_rule_check applied all levels at once and silently left the
+    # same-DOI pair as a duplicate). A lower-level contradiction rejects only
+    # when there is NO equality at a higher level.
+
+    # DOI: conflict → never the same publication; equality → definite merge
     w_doi = w.get("_norm_doi")
     s_doi = s.get("_norm_doi")
     doi_note = ""
+    doi_variant = False
     if _present(w_doi) and _present(s_doi) and w_doi != s_doi:
         if not doi_separator_variants(w_doi, s_doi):
             return None
-        # Separator spelling only: the veto is lifted but the DOI is not
-        # evidence. The pair must pass the stages below - never Stage 1.
-        doi_note = f" | DOI spelling differs: {w_doi} <-> {s_doi}"
+        # Separator/spelling difference: the veto is lifted, the DOI is not counted
+        # as evidence. The pair must go through the title/year/author stages
+        # below — Stage 1 is not produced.
+        doi_variant = True
+        doi_note = f" | DOI spelling variant: {w_doi} <-> {s_doi}"
     elif _present(w_doi) and _present(s_doi):
         return {
-            "stage": "1_doi_exact", "stage_label": "DOI exact", "confidence": 1.00,
+            "stage": "1_doi_exact",
+            "stage_label": "DOI exact",
+            "confidence": 1.00,
             "reason": f"DOI exact: {w_doi}",
-            "jw_title": None, "year_diff": None, "surname_match": None,
+            "doi": w_doi,
+            "doi_variant": False,
+            "jw_title": None,
+            "year_diff": None,
+            "surname_match": None,
         }
 
-    # PMID (when DOIs could not be compared): conflict -> reject; equal -> merge
+    # PMID (if the DOI could not be compared): conflict → reject; equality → merge
+    # (UT is not the same across databases, only PMID)
     w_pmid = w.get("_norm_pmid")
     s_pmid = s.get("_norm_pmid")
     if _present(w_pmid) and _present(s_pmid):
         if w_pmid != s_pmid:
             return None
         return {
-            "stage": "2_pmid_exact", "stage_label": "PMID exact", "confidence": 0.99,
+            "stage": "2_pmid_exact",
+            "stage_label": "PMID exact",
+            "confidence": 0.99,
             "reason": f"PMID exact: {w_pmid}",
-            "jw_title": None, "year_diff": None, "surname_match": None,
+            "doi": "",
+            "doi_variant": doi_variant,
+            "jw_title": None,
+            "year_diff": None,
+            "surname_match": None,
         }
 
-    # ISSN (journal-level guard): only vetoes the title-based stages
+    # ISSN (journal-level safeguard): vetoes only the title stages
     w_issn = w.get("_norm_issn")
     s_issn = s.get("_norm_issn")
     if _present(w_issn) and _present(s_issn) and w_issn != s_issn:
         return None
 
-    # Stage 3 — Title JW + Year +-1 + Surname
+    # Stage 3 — Title JW ≥ 0.92 + Year ±1 + Surname match
     w_title = w.get("_norm_title", "")
     s_title = s.get("_norm_title", "")
     if w_title and s_title:
@@ -411,9 +451,12 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
         s_surname = s.get("_norm_surname", "")
         surname_match = bool(w_surname and s_surname and w_surname == s_surname)
 
-        # Generic/short titles ("Editorial", "Erratum") can belong to several
-        # distinct papers by the same author in the same year; they may only
-        # merge via identifiers or Journal+Volume+Pages.
+        # Generic/short title safeguard: titles such as "Editorial", "Erratum",
+        # "Preface" can belong to MORE THAN ONE different publication by the same
+        # author in the same year (a journal's editor writes an editorial for
+        # every issue). Such titles cannot automatically enter Stage 3; they are
+        # merged only via an identifier (DOI/PMID) or Stage 4
+        # (journal+volume+page).
         informative_title = len(w_title.split()) >= 3 or len(w_title) >= 15
 
         if (
@@ -424,17 +467,25 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
             and surname_match
         ):
             return {
-                "stage": "3_title_year_surname", "stage_label": "Title+Year+Surname",
+                "stage": "3_title_year_surname",
+                "stage_label": "Title+Year+Surname",
                 "confidence": 0.95,
-                "reason": f"JW(title)={jw_title:.3f} >= {TITLE_EXACT_THRESHOLD}, year_diff={year_diff}, surname='{w_surname}'" + doi_note,
-                "jw_title": round(jw_title, 4), "year_diff": year_diff, "surname_match": surname_match,
+                "reason": f"JW(title)={jw_title:.3f} >= {TITLE_EXACT_THRESHOLD}, year_diff={year_diff}, surname '{w_surname}' matched" + doi_note,
+                "doi": "",
+                "doi_variant": doi_variant,
+                "jw_title": round(jw_title, 4),
+                "year_diff": year_diff,
+                "surname_match": surname_match,
             }
 
-        # Stage 4 — Journal + Volume + (Pages or BP)
+        # Stage 4 — Journal + Volume + (Pages or BP) — for old publications without a DOI
         w_journal = w.get("_norm_journal", "")
         s_journal = s.get("_norm_journal", "")
         if w_journal and s_journal:
             jw_journal = jaro_winkler(w_journal, s_journal)
+            # The xlsx path turns numeric fields into floats ("100.0"); WoS txt
+            # gives strings ("100"). Without stripping the ".0" tail, the
+            # comparison would always miss.
             w_vol = _clean_num(w.get("VL", ""))
             s_vol = _clean_num(s.get("VL", ""))
             w_bp = _clean_num(w.get("BP", ""))
@@ -448,20 +499,31 @@ def compute_match(w: dict, s: dict) -> Optional[dict]:
                 and page_match
             ):
                 return {
-                    "stage": "4_journal_vol_page", "stage_label": "Journal+Vol+Pages",
+                    "stage": "4_journal_vol_page",
+                    "stage_label": "Journal+Vol+Pages",
                     "confidence": 0.90,
                     "reason": f"JW(journal)={jw_journal:.3f}, vol={w_vol}, page_match=True" + doi_note,
-                    "jw_title": round(jw_title, 4), "year_diff": year_diff, "surname_match": surname_match,
+                    "doi": "",
+                    "doi_variant": doi_variant,
+                    "jw_title": round(jw_title, 4),
+                    "year_diff": year_diff,
+                    "surname_match": surname_match,
                 }
 
-        # Stage 5 — Borderline (manual review range)
+        # Stage 5 — Borderline (manual queue)
         if TITLE_BORDERLINE_LOW <= jw_title < TITLE_EXACT_THRESHOLD:
+            # Confidence linear scale 0.70-0.85
             conf = 0.70 + (jw_title - TITLE_BORDERLINE_LOW) * (0.85 - 0.70) / (TITLE_EXACT_THRESHOLD - TITLE_BORDERLINE_LOW)
             return {
-                "stage": "5_borderline", "stage_label": "Borderline (manual review)",
+                "stage": "5_borderline",
+                "stage_label": "Borderline (manual review)",
                 "confidence": round(conf, 3),
                 "reason": f"JW(title)={jw_title:.3f}, year_diff={year_diff}, surname_match={surname_match}" + doi_note,
-                "jw_title": round(jw_title, 4), "year_diff": year_diff, "surname_match": surname_match,
+                "doi": "",
+                "doi_variant": doi_variant,
+                "jw_title": round(jw_title, 4),
+                "year_diff": year_diff,
+                "surname_match": surname_match,
             }
 
     return None
@@ -526,26 +588,70 @@ def _apply_preference(field: str, w_val: Any, s_val: Any) -> tuple[Any, str]:
     return s_val, "scopus"
 
 
-def merge_pair_with_preferences(pair_id: str, w: dict, s: dict, all_columns: list[str]) -> tuple[dict, list[dict]]:
+_INT_LIKE_RE = re.compile(r"\d+(\.0+)?")
+
+
+def _same_for_conflict(w_val: Any, s_val: Any) -> bool:
+    """Conflict-log equality: case/space-insensitive text, or the same whole number.
+
+    A WoS volume that went through an xlsx round trip is '154.0' while Scopus has '154';
+    those are the same value, not a conflict. Only which rows are LOGGED depends on this;
+    the chosen/merged value never does.
+    """
+    a = _to_str(w_val).lower().strip()
+    b = _to_str(s_val).lower().strip()
+    if a == b:
+        return True
+    if _INT_LIKE_RE.fullmatch(a) and _INT_LIKE_RE.fullmatch(b):
+        return _clean_num(a) == _clean_num(b)
+    return False
+
+
+def merge_pair_with_preferences(
+    pair_id: str,
+    w: dict,
+    s: dict,
+    all_columns: list[str],
+) -> tuple[dict, list[dict]]:
+    """Merge two records and log the conflicts.
+
+    Returns: (merged_row, conflicts_list)
+    """
     merged: dict[str, Any] = {}
     conflicts: list[dict] = []
+
     for col in all_columns:
         if col.startswith("_norm_"):
+            continue  # internal columns
+        if col == UID_COL:
+            # A matched pair keeps the WoS row's identity; the Scopus row's is retired.
+            # The two always differ, so this is identity bookkeeping and never a
+            # field conflict (conflict_log.xlsx and the source distribution stay unchanged).
+            w_uid, s_uid = w.get(col), s.get(col)
+            merged[col] = s_uid if _is_empty(w_uid) else w_uid
             continue
         w_val = w.get(col)
         s_val = s.get(col)
         chosen, source = _apply_preference(col, w_val, s_val)
         merged[col] = chosen
+
+        # Conflict log: both sides are filled AND the values differ
         if not _is_empty(w_val) and not _is_empty(s_val):
-            if _to_str(w_val).lower().strip() != _to_str(s_val).lower().strip():
+            if not _same_for_conflict(w_val, s_val):
                 conflicts.append({
-                    "pair_id": pair_id, "field": col,
-                    "wos_value": _to_str(w_val)[:200], "scopus_value": _to_str(s_val)[:200],
-                    "chosen_source": source, "chosen_value": _to_str(chosen)[:200],
+                    "pair_id": pair_id,
+                    "field": col,
+                    "wos_value": _to_str(w_val)[:200],
+                    "scopus_value": _to_str(s_val)[:200],
+                    "chosen_source": source,
+                    "chosen_value": _to_str(chosen)[:200],
                     "preference_rule": FIELD_PREFERENCES.get(col, DEFAULT_PREFERENCE),
                 })
+
+    # DB labeling — merged record
     merged["DB"] = "BIBEXPY_SMART"
     merged["DB_Original"] = "ISI; SCOPUS"
+
     return merged, conflicts
 
 
@@ -555,8 +661,8 @@ def merge_pair_with_preferences(pair_id: str, w: dict, s: dict, all_columns: lis
 
 @dataclass
 class SmartMergeResult:
-    merged: pd.DataFrame          # final deduplicated dataset (definite matches + unmatched)
-    borderline: pd.DataFrame      # uncertain pairs kept separate (review manually)
+    merged: pd.DataFrame          # final deduplicated dataset (UID = sequential key 1..N, first column)
+    borderline: pd.DataFrame      # uncertain pairs kept separate (wos_uid/scp_uid = their UIDs in merged)
     conflicts: pd.DataFrame       # field-level conflicts resolved during merge
     lost_wos: pd.DataFrame        # WoS records with no match
     lost_scopus: pd.DataFrame     # Scopus records with no match
@@ -688,6 +794,73 @@ def generate_candidates(
     return candidates
 
 
+def _assign_source_ids(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> None:
+    """Give every WoS and Scopus source row a TEMPORARY id, IN PLACE, before dedup and matching.
+
+    The id lives in the UID column only while the merge runs ("w0", "w1", ... and "s0", "s1", ...,
+    by row position, so the two sources can never collide). Any UID a re-imported export already
+    carried is overwritten: the sequential keys 1..N (the same numbering BibexPy assigns) are assigned once, when the final
+    frame is assembled (see :func:`_assign_final_keys`), and are the only keys that survive.
+    """
+    wos_df[UID_COL] = [f"w{i}" for i in range(len(wos_df))]
+    scp_df[UID_COL] = [f"s{i}" for i in range(len(scp_df))]
+
+
+def _assign_final_keys(
+    final_df: pd.DataFrame,
+    matches: list[dict],
+    borderline: list[dict],
+    wos_not_matched: pd.DataFrame,
+    scp_not_matched: pd.DataFrame,
+) -> int:
+    """Assign the permanent sequential keys 1..N to the final frame and translate every reference.
+
+    ``final_df`` is, in this order, the merged pairs (one row per entry of ``matches``), the
+    unmatched WoS rows and the unmatched Scopus rows, each carrying the temporary id of its
+    source row. All of it is rewritten IN PLACE:
+      * final_df[UID] = 1..N in that order (int64);
+      * every match gets ``uid`` = the key of its merged row (no temporary ids survive);
+      * every borderline item's wos_uid/scp_uid = the final keys of its two rows (both rows are in
+        the final dataset: a pending pair is two separate rows, or rows that were matched elsewhere);
+      * the unmatched frames (Lost_WoS.xlsx / Lost_Scopus.xlsx) carry the final key of their row in UID.
+    Returns N (the number of final records).
+    """
+    import numpy as np
+
+    expected = ([m["wos_tmp"] for m in matches]
+                + list(wos_not_matched[UID_COL]) + list(scp_not_matched[UID_COL]))
+    if len(expected) != len(final_df) or list(final_df[UID_COL]) != expected:
+        raise RuntimeError(
+            "merge_uid_mismatch: the final frame is not (pairs, unmatched WoS, unmatched Scopus) in order"
+        )
+    temp_to_key: dict[str, int] = {}
+    for i, m in enumerate(matches):
+        key = i + 1
+        temp_to_key[m["wos_tmp"]] = key
+        temp_to_key[m["scp_tmp"]] = key
+        m["uid"] = key
+    pos = len(matches)
+    for frame in (wos_not_matched, scp_not_matched):
+        keys = []
+        for temp in frame[UID_COL]:
+            pos += 1
+            temp_to_key[temp] = pos
+            keys.append(pos)
+        frame[UID_COL] = np.asarray(keys, dtype="int64")
+    for b in borderline:
+        b["wos_uid"] = temp_to_key[b["wos_uid"]]
+        b["scp_uid"] = temp_to_key[b["scp_uid"]]
+    final_df[UID_COL] = np.arange(1, len(final_df) + 1, dtype="int64")
+    return int(len(final_df))
+
+
+def _uid_first(df: pd.DataFrame) -> pd.DataFrame:
+    """Return df with the UID column first (presentation only)."""
+    if UID_COL not in df.columns:
+        return df
+    return df[[UID_COL] + [c for c in df.columns if c != UID_COL]]
+
+
 def smart_merge(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> SmartMergeResult:
     """Merge + deduplicate a WoS and a Scopus DataFrame.
 
@@ -698,6 +871,9 @@ def smart_merge(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> SmartMergeResult:
     scp_df = scp_df.copy().reset_index(drop=True)
     wos_df["DB"] = "ISI"
     scp_df["DB"] = "SCOPUS"
+
+    # Temporary row ids for matching; the permanent keys are assigned at the end (_assign_final_keys).
+    _assign_source_ids(wos_df, scp_df)
 
     _add_norm_columns(wos_df)
     _add_norm_columns(scp_df)
@@ -725,6 +901,10 @@ def smart_merge(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> SmartMergeResult:
             s_row = scp_df.loc[s_idx]
             borderline_rows.append({
                 "pair_id": pair_id,
+                # Temporary source ids here, translated to the final keys of the two rows
+                # by _assign_final_keys before the result is returned.
+                "wos_uid": _to_str(w_row.get(UID_COL, "")),
+                "scp_uid": _to_str(s_row.get(UID_COL, "")),
                 "jw_title": m["jw_title"], "confidence": m["confidence"],
                 "wos_title": _to_str(w_row.get("TI", ""))[:300],
                 "scp_title": _to_str(s_row.get("TI", ""))[:300],
@@ -737,9 +917,14 @@ def smart_merge(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> SmartMergeResult:
             matched_wos.add(w_idx)
             matched_scp.add(s_idx)
             stage_counts[m["stage_label"]] = stage_counts.get(m["stage_label"], 0) + 1
-            matches.append({"pair_id": pair_id, "wos_index": int(w_idx), "scp_index": int(s_idx), **m})
+            matches.append({"pair_id": pair_id,
+                            # Temporary source ids; the final key is added as ``uid`` by _assign_final_keys.
+                            "wos_tmp": _to_str(wos_df.at[w_idx, UID_COL]),
+                            "scp_tmp": _to_str(scp_df.at[s_idx, UID_COL]),
+                            "wos_index": int(w_idx), "scp_index": int(s_idx), **m})
 
-    all_columns = list(set(list(wos_df.columns) + list(scp_df.columns)))
+    # First-seen order (WoS then Scopus): a set() would make the column order hash-seed dependent.
+    all_columns = list(dict.fromkeys(c for cols in (wos_df.columns, scp_df.columns) for c in cols))
     conflicts: list[dict] = []
     merged_rows: list[dict] = []
     for match in matches:
@@ -761,6 +946,13 @@ def smart_merge(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> SmartMergeResult:
     scp_not_matched = _drop_norm(scp_not_matched)
 
     final_df = pd.concat([merged_df, wos_not_matched, scp_not_matched], ignore_index=True)
+    # Permanent sequential keys 1..N in the final row order; borderline wos_uid/scp_uid and the
+    # unmatched frames are translated to them in place.
+    _assign_final_keys(final_df, matches, borderline_rows, wos_not_matched, scp_not_matched)
+    # Presentation only: show the key first.
+    final_df = _uid_first(final_df)
+    wos_not_matched = _uid_first(wos_not_matched)
+    scp_not_matched = _uid_first(scp_not_matched)
 
     # CR normalization — Scopus-grammar cited references are rewritten into
     # WoS grammar. Otherwise VOSviewer / bibliometrix cannot match any reference
@@ -769,7 +961,9 @@ def smart_merge(wos_df: pd.DataFrame, scp_df: pd.DataFrame) -> SmartMergeResult:
     # is idempotent; comma-less WoS rows pass through unchanged.
     cr_normalized = nr_filled = 0
     if "CR" in final_df.columns:
-        before = final_df["CR"].fillna("").astype(str)
+        # Cells as text, missing -> "" (no fillna downcast on a float CR column under pandas 3).
+        before = pd.Series(["" if pd.isna(v) else str(v) for v in final_df["CR"].tolist()],
+                           index=final_df.index, dtype=object)
         after = before.map(normalize_cr)
         filled_cr = before.str.strip() != ""
         changed = filled_cr & (after != before)
